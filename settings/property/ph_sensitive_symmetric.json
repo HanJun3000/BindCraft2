@@ -1,0 +1,5 @@
+{
+  "description": "Favour His-acid pairs across the interface in either direction — binder histidine to target D/E, or binder D/E to target histidine — for a pH-sensitive binder",
+  "weights_interface_his_acid_symmetric": 1.0,
+  "min_interface_ph_pairs_final": 1
+}
