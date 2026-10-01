@@ -7,7 +7,7 @@ from jax.scipy.linalg import block_diag
 from typing import Callable, NamedTuple
 from jax import Array
 from bindcraft.developability import EPITOPE_CORE_LENGTH, HYDROPHOBICITY, MHCPanel, mhc_panels, protease_panel
-from bindcraft.protein import AMINO_ACIDS, ATOM_INDEX, BINDER_ALONE, Protein, ProteinStates, ResidueFlags, StructurePredictions, alignment_matrix_product, has_residue_flag, kabsch, real_residue_count, real_residue_mask, real_residue_weights, redesignable_residue_mask
+from bindcraft.protein import AMINO_ACID_INDEX, AMINO_ACIDS, ATOM_INDEX, BINDER_ALONE, Protein, ProteinStates, ResidueFlags, StructurePredictions, alignment_matrix_product, has_residue_flag, kabsch, real_residue_count, real_residue_mask, real_residue_weights, redesignable_residue_mask
 
 class DesignLoss(NamedTuple):
     function: Callable[[ProteinStates, StructurePredictions], Array]
@@ -270,6 +270,48 @@ def pooled_protease_site_score(chains) -> Array:
 def protease_site_loss(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str='complex', chain: str='binder') -> Array:
     protein_complex = protein_states[resolve_prediction_state(predictions, prediction_state)]
     return pooled_protease_site_score([(jax.nn.softmax(protein_complex[name].sequence.astype(jnp.float32)), redesignable_residue_mask(protein_complex[name].flags)) for name in binder_copy_chains(protein_complex, chain)])
+
+@loss('interface_his_acid_pairing', target_weighting='binds_target')
+def interface_his_acid_pairing_loss(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str='complex', binder: str='binder', target: str='target', cutoff: float=8.0) -> Array:
+    """Reward binder histidines that are geometrically close to target D/E residues.
+
+    Protonated histidine (low pH ~6.4) can form a salt bridge with aspartate or
+    glutamate; at neutral pH (~7.5) the neutral imidazole loses that electrostatic
+    attraction. Minimising this (negative) reward therefore enriches the interface
+    for the sequence ingredients of a pH-sensitive binder.
+
+    The score is differentiable: His probability comes from the soft binder sequence,
+    target acids are a fixed one-hot mask, and proximity comes from the AF2 distogram.
+    """
+    prediction_state = resolve_prediction_state(predictions, prediction_state)
+    target_name = resolve_target_chain(protein_states[prediction_state], target, prediction_state)
+    protein_complex = protein_states[prediction_state]
+    binder_chains = binder_copy_chains(protein_complex, binder)
+
+    # Binder: soft His probability at every redesignable position
+    binder_seq = jnp.concatenate([amino_acid_probabilities(protein_complex[name].sequence) for name in binder_chains])
+    binder_mask = jnp.concatenate([redesignable_residue_mask(protein_complex[name].flags) for name in binder_chains]).astype(jnp.float32)
+    his_prob = binder_seq[:, AMINO_ACID_INDEX['H']]  # (n_binder,)
+
+    # Target: fixed D/E mask — target is not redesigned so softmax is effectively one-hot
+    target_seq = jax.nn.softmax(protein_complex[target_name].sequence.astype(jnp.float32))
+    acid_prob = (target_seq[:, AMINO_ACID_INDEX['D']] + target_seq[:, AMINO_ACID_INDEX['E']]) * real_residue_mask(protein_complex[target_name].flags)  # (n_target,)
+
+    # Soft proximity: fraction of distogram probability mass within cutoff
+    chain_slices = chain_residue_slices(protein_complex)
+    binder_rows = chain_group_rows(protein_complex, binder_chains)
+    target_start, target_stop = chain_slices[target_name].start, chain_slices[target_name].stop
+    target_rows = jnp.arange(target_start, target_stop)
+    distogram = predictions[prediction_state].metrics['distogram']
+    sub_distogram = distogram[binder_rows[:, None], target_rows[None, :]].astype(jnp.float32)  # (n_binder, n_target, n_bins)
+    bin_distances = distogram_bin_distances(distogram.shape[-1])
+    contact_prob = (jax.nn.softmax(sub_distogram, axis=-1) * (bin_distances < cutoff)[None, None, :]).sum(-1)  # (n_binder, n_target)
+
+    # Per-binder-residue reward: P(H at i) * weighted sum of acid proximity
+    per_residue_score = his_prob * (contact_prob * acid_prob[None, :]).sum(-1)  # (n_binder,)
+
+    # Return negative reward — optimizer minimises, so this drives His toward acids
+    return -_masked_mean(per_residue_score, binder_mask)
 
 def binder_residue_exposure(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str, chain: str, radius: float=10.0, contact_temperature: float=2.0, neighbor_threshold: float=16.0, temperature: float=4.0) -> Array:
     predicted_complex = predictions[prediction_state].protein_complex

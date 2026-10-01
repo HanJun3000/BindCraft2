@@ -1,0 +1,5 @@
+{
+  "description": "Favour interface histidines paired with target acidic residues (D/E) — the sequence ingredient for a pH-sensitive binder that binds at low pH and releases at neutral pH",
+  "weights_interface_his_acid_pairing": 1.0,
+  "min_interface_his_acid_pairs_final": 1
+}

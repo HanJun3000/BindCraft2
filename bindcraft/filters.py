@@ -683,6 +683,41 @@ def interface_amino_acid_count(protein_states: ProteinStates, predictions: Struc
     binder_sequence = np.concatenate([binder_one_letter_sequence(protein_complex[name]) for name in binder_copy_chains(protein_complex, binder)])
     return float((interface_residues & (binder_sequence == amino_acid)).sum())
 
+@filter_metric('Interface_His_Acid_Pairs')
+def interface_his_acid_pairs_metric(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str='complex', binder: str='binder', target: str='target', cutoff: float=4.0) -> float:
+    """Count binder His residues within `cutoff` Å (Cβ, Cα for Gly) of a target D or E.
+
+    This is the hard-structure acceptance filter for the ph_sensitive property. A value
+    of at least 1 means at least one interface histidine is geometrically paired with
+    an acidic residue on the target, the minimal requirement for a pH switch.
+    """
+    prediction_state = resolve_prediction_state(predictions, prediction_state)
+    protein_complex = predictions[prediction_state].protein_complex
+    target_name = resolve_target_chain(protein_complex, target, prediction_state)
+    binder_chains = binder_copy_chains(protein_complex, binder)
+
+    binder_sequence = np.concatenate([binder_one_letter_sequence(protein_complex[name]) for name in binder_chains])
+    target_sequence = binder_one_letter_sequence(protein_complex[target_name])
+
+    his_mask = binder_sequence == 'H'
+    acid_mask = (target_sequence == 'D') | (target_sequence == 'E')
+    if not his_mask.any() or not acid_mask.any():
+        return 0.0
+
+    def cb_or_ca_coords(chain_name: str) -> np.ndarray:
+        cb = np.asarray(chain_atom_coordinates(protein_complex[chain_name], 'CB')[0])
+        ca = np.asarray(chain_atom_coordinates(protein_complex[chain_name], 'CA')[0])
+        cb_present = np.asarray(protein_complex[chain_name].atom_mask[:, ATOM_INDEX['CB']]).astype(bool)
+        return np.where(cb_present[:, None], cb, ca)
+
+    binder_coords = np.concatenate([cb_or_ca_coords(name) for name in binder_chains])
+    target_coords = cb_or_ca_coords(target_name)
+
+    # distances between every binder His and every target acid: (n_his, n_acid)
+    distances = np.linalg.norm(binder_coords[his_mask, None, :] - target_coords[None, acid_mask, :], axis=-1)
+    # count His residues that have at least one acid partner within the cutoff
+    return float((distances.min(axis=-1) < cutoff).sum())
+
 def paired_cysteine_count(deviation, pairable) -> int:
     bonded, bonds = set(), 0
     for first, second in sorted(zip(*np.nonzero(pairable)), key=lambda pair: deviation[pair]):
