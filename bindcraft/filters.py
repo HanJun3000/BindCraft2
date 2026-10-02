@@ -7,7 +7,7 @@ import numpy as np
 from typing import Callable, NamedTuple, TYPE_CHECKING
 from bindcraft.epitope_targeting import EPITOPE_CUTOFF, epitope_residues
 from bindcraft.developability import mhc_panels
-from bindcraft.loss import _masked_mean, align_binder_coordinates, aligned_binder_tm_score, bind_state_metric, binder_binding_mask, binder_copy_chains, binder_framework_mask, bound_and_unbound_binder_coordinates, chain_atom_coordinates, chain_pair_pae_loss, chain_residue_slices, complex_residue_weights, core_aligned_interface_rmsd, induced_fit_interface_masks, mhc_epitope_score, pairwise_atom_distances, pooled_protease_site_score, resolve_binder_role, resolve_prediction_state, resolve_target_chain, soft_maximum, terminus_target_direction_cosine
+from bindcraft.loss import BURIAL_CONTACT_TEMPERATURE, BURIAL_TEMPERATURE, COULOMB_PREFACTOR, HISTIDINE_MODEL_PKA, LOG10_RT, _masked_mean, align_binder_coordinates, aligned_binder_tm_score, bind_state_metric, binder_binding_mask, binder_copy_chains, binder_framework_mask, bound_and_unbound_binder_coordinates, chain_atom_coordinates, chain_pair_pae_loss, chain_residue_slices, complex_residue_weights, core_aligned_interface_rmsd, induced_fit_interface_masks, mhc_epitope_score, pairwise_atom_distances, ph_switch_quality, pooled_protease_site_score, resolve_binder_role, resolve_prediction_state, resolve_target_chain, soft_maximum, terminus_target_direction_cosine
 from bindcraft.protein import AMINO_ACIDS, ATOM_INDEX, BINDER_ALONE, Protein, ProteinStates, ResidueFlags, StructurePredictions, build_atom_array, has_residue_flag, output_chain_letters, parse_scaffold_edits, real_residue_count, real_residue_mask, redesignable_residue_mask, structure_chain_names
 
 if TYPE_CHECKING:
@@ -690,44 +690,71 @@ def cb_or_ca_coordinates(protein: Protein) -> np.ndarray:
     cb_present = np.asarray(protein.atom_mask[:, ATOM_INDEX['CB']]).astype(bool)
     return np.where(cb_present[:, None], cb, ca)
 
-def ph_pair_count(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str, binder: str, target: str, cutoff: float, binder_residues: str, target_residues: str) -> float:
-    """Count binder residues in `binder_residues` within `cutoff` Å (Cβ, Cα for Gly)
-    of any target residue in `target_residues`.
+#A histidine-carboxylate ion pair is defined between the groups that actually carry the charge:
+#an imidazole nitrogen and a carboxylate oxygen, within the usual 4 A salt-bridge distance.
+#Cbeta is NOT usable here. Measured over the bundled target and scaffold structures, a genuine
+#His N...carboxylate O contact (<3.5 A) sits at 5.85-7.23 A between the two Cbeta atoms, so a
+#4 A Cbeta criterion has zero recall -- it cannot fire even for a textbook salt bridge.
+HIS_IMIDAZOLE_NITROGENS = {'H': ('ND1', 'NE2')}
+CARBOXYLATE_OXYGENS = {'D': ('OD1', 'OD2'), 'E': ('OE1', 'OE2')}
 
-    Counts binder residues that have at least one qualifying partner, so two acids beside
-    one histidine score 1, not 2.
+def charged_group_coordinates(protein: Protein, residue_atoms: dict[str, tuple[str, ...]]) -> tuple[np.ndarray, np.ndarray]:
+    """Charge-carrying side-chain atoms per residue, plus a mask of which are resolved.
+
+    Returns (n_residue, n_slot, 3) coordinates and an (n_residue, n_slot) mask that is set only
+    for residues of the requested types whose atoms the prediction actually resolved. Padding
+    and other residue types come back entirely masked out.
     """
+    sequence = binder_one_letter_sequence(protein)
+    atoms, atom_mask = np.asarray(protein.atoms), np.asarray(protein.atom_mask).astype(bool)
+    real = np.asarray(real_residue_mask(protein.flags)).astype(bool)
+    slots = max(len(names) for names in residue_atoms.values())
+    coordinates, resolved = np.zeros((len(sequence), slots, 3)), np.zeros((len(sequence), slots), dtype=bool)
+    for residue, names in residue_atoms.items():
+        rows = (sequence == residue) & real
+        for slot, name in enumerate(names):
+            coordinates[rows, slot] = atoms[rows, ATOM_INDEX[name]]
+            resolved[rows, slot] = atom_mask[rows, ATOM_INDEX[name]]
+    return coordinates, resolved
+
+def salt_bridge_paired_rows(protein_complex: dict[str, Protein], binder_chains: tuple[str, ...], target_name: str, cutoff: float, binder_atoms: dict[str, tuple[str, ...]], target_atoms: dict[str, tuple[str, ...]]) -> np.ndarray:
+    """Rows of the binder residues that form a side-chain ion pair with the target.
+
+    Rows index the sorted-chain concatenation of the whole complex, so they line up with
+    paired_interface_histidine_pka. A binder residue is counted once however many partners it
+    has, so two carboxylates beside one histidine score 1, not 2.
+    """
+    binder_coordinates, binder_resolved = (np.concatenate(parts) for parts in zip(*(charged_group_coordinates(protein_complex[name], binder_atoms) for name in binder_chains)))
+    target_coordinates, target_resolved = charged_group_coordinates(protein_complex[target_name], target_atoms)
+    chain_slices = chain_residue_slices(protein_complex)
+    binder_rows = np.concatenate([np.arange(chain_slices[name].start, chain_slices[name].stop) for name in binder_chains])
+    if not binder_resolved.any() or not target_resolved.any():
+        return np.zeros(0, dtype=int)
+
+    #(n_binder, binder_slots, n_target, target_slots) — every charged atom against every other
+    separation = np.linalg.norm(binder_coordinates[:, :, None, None, :] - target_coordinates[None, None, :, :, :], axis=-1)
+    separation = np.where(binder_resolved[:, :, None, None] & target_resolved[None, None, :, :], separation, np.inf)
+    return binder_rows[separation.min(axis=(1, 2, 3)) < cutoff]
+
+def ph_pair_count(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str, binder: str, target: str, cutoff: float, binder_atoms: dict[str, tuple[str, ...]], target_atoms: dict[str, tuple[str, ...]]) -> float:
+    """Number of binder residues forming a His-carboxylate ion pair with the target."""
     prediction_state = resolve_prediction_state(predictions, prediction_state)
     protein_complex = predictions[prediction_state].protein_complex
     target_name = resolve_target_chain(protein_complex, target, prediction_state)
     binder_chains = binder_copy_chains(protein_complex, binder)
-
-    binder_sequence = np.concatenate([binder_one_letter_sequence(protein_complex[name]) for name in binder_chains])
-    target_sequence = binder_one_letter_sequence(protein_complex[target_name])
-
-    binder_selected = np.isin(binder_sequence, list(binder_residues))
-    target_selected = np.isin(target_sequence, list(target_residues))
-    if not binder_selected.any() or not target_selected.any():
-        return 0.0
-
-    binder_coords = np.concatenate([cb_or_ca_coordinates(protein_complex[name]) for name in binder_chains])
-    target_coords = cb_or_ca_coordinates(protein_complex[target_name])
-
-    # (n_selected_binder, n_selected_target)
-    distances = np.linalg.norm(binder_coords[binder_selected, None, :] - target_coords[None, target_selected, :], axis=-1)
-    return float((distances.min(axis=-1) < cutoff).sum())
+    return float(len(salt_bridge_paired_rows(protein_complex, binder_chains, target_name, cutoff, binder_atoms, target_atoms)))
 
 @filter_metric('Interface_His_Acid_Pairs')
 def interface_his_acid_pairs_metric(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str='complex', binder: str='binder', target: str='target', cutoff: float=4.0) -> float:
-    """Binder His residues paired with a target D or E — the forward pH-switch direction,
+    """Binder His residues ion-paired with a target D or E — the forward pH-switch direction,
     where the titrating histidine is the one that was designed."""
-    return ph_pair_count(protein_states, predictions, prediction_state, binder, target, cutoff, 'H', 'DE')
+    return ph_pair_count(protein_states, predictions, prediction_state, binder, target, cutoff, HIS_IMIDAZOLE_NITROGENS, CARBOXYLATE_OXYGENS)
 
 @filter_metric('Interface_Acid_His_Pairs')
 def interface_acid_his_pairs_metric(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str='complex', binder: str='binder', target: str='target', cutoff: float=4.0) -> float:
-    """Binder D/E residues paired with a target His — the reverse pH-switch direction,
+    """Binder D/E residues ion-paired with a target His — the reverse pH-switch direction,
     exploiting a histidine the target already carries."""
-    return ph_pair_count(protein_states, predictions, prediction_state, binder, target, cutoff, 'DE', 'H')
+    return ph_pair_count(protein_states, predictions, prediction_state, binder, target, cutoff, CARBOXYLATE_OXYGENS, HIS_IMIDAZOLE_NITROGENS)
 
 @filter_metric('Interface_pH_Pairs')
 def interface_ph_pairs_metric(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str='complex', binder: str='binder', target: str='target', cutoff: float=4.0) -> float:
@@ -740,6 +767,66 @@ def interface_ph_pairs_metric(protein_states: ProteinStates, predictions: Struct
     """
     return (interface_his_acid_pairs_metric(protein_states, predictions, prediction_state, binder, target, cutoff)
             + interface_acid_his_pairs_metric(protein_states, predictions, prediction_state, binder, target, cutoff))
+
+def expit(values: np.ndarray) -> np.ndarray:
+    """Logistic sigmoid, written via tanh so large-magnitude inputs do not overflow."""
+    return 0.5 * (1.0 + np.tanh(0.5 * values))
+
+def paired_interface_histidine_pka(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str, binder: str, target: str, cutoff: float, dielectric: float, debye_length: float, desolvation: float, burial_radius: float, burial_midpoint: float, min_charge_distance: float) -> np.ndarray:
+    """Estimated pKa of every binder histidine that is paired with a target D/E.
+
+    Numpy mirror of loss.histidine_protonation_environment, evaluated on the final predicted
+    structure with the sequence taken as argmax, so a campaign can be read back against the
+    same pKa model the loss optimised. Returns an empty array when no such pair exists.
+    """
+    prediction_state = resolve_prediction_state(predictions, prediction_state)
+    protein_complex = predictions[prediction_state].protein_complex
+    target_name = resolve_target_chain(protein_complex, target, prediction_state)
+    binder_chains = binder_copy_chains(protein_complex, binder)
+    chain_names = sorted(protein_complex)
+
+    #Which histidines count as paired is the salt-bridge criterion, matching Interface_His_Acid_Pairs;
+    #the pKa model itself then runs on Cbeta, matching the loss, which cannot see side chains.
+    paired = salt_bridge_paired_rows(protein_complex, binder_chains, target_name, cutoff, HIS_IMIDAZOLE_NITROGENS, CARBOXYLATE_OXYGENS)
+    if not len(paired):
+        return np.zeros(0)
+
+    coordinates = np.concatenate([cb_or_ca_coordinates(protein_complex[name]) for name in chain_names])
+    sequence = np.concatenate([binder_one_letter_sequence(protein_complex[name]) for name in chain_names])
+    real = np.concatenate([np.asarray(real_residue_mask(protein_complex[name].flags)) for name in chain_names]).astype(float)
+    charge = (np.isin(sequence, list('KR')).astype(float) - np.isin(sequence, list('DE')).astype(float)) * real
+    distance = np.linalg.norm(coordinates[paired, None, :] - coordinates[None, :, :], axis=-1)
+    partner = np.tile(real, (len(paired), 1))
+    partner[np.arange(len(paired)), paired] = 0.0                                  # drop the histidine's own row
+
+    screened = np.exp(-distance / debye_length) / np.maximum(distance, min_charge_distance)
+    coulomb_shift = -(COULOMB_PREFACTOR / (dielectric * LOG10_RT)) * (charge[None, :] * screened * partner).sum(-1)
+    neighbors = (expit((burial_radius - distance) / BURIAL_CONTACT_TEMPERATURE) * partner).sum(-1)
+    return HISTIDINE_MODEL_PKA + coulomb_shift - desolvation * expit((neighbors - burial_midpoint) / BURIAL_TEMPERATURE)
+
+@filter_metric('Interface_pH_Switch')
+def interface_ph_switch_metric(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str='complex', binder: str='binder', target: str='target', cutoff: float=4.0, binding_ph: float=6.4, release_ph: float=7.5, dielectric: float=40.0, debye_length: float=8.0, desolvation: float=2.0, burial_radius: float=10.0, burial_midpoint: float=16.0, min_charge_distance: float=3.0) -> float:
+    """Summed switch quality of the interface histidines — the acceptance filter for ph_sensitive_pka.
+
+    Each histidine paired with a target carboxylate contributes between 0 and 1 according to
+    how much of its protonation it actually swings between binding_ph and release_ph, so 1.0
+    means roughly one ideally-tuned histidine. Unlike Interface_His_Acid_Pairs, which counts
+    pairs, this does not reward a histidine whose pKa has been pushed out of the working range.
+    """
+    pka = paired_interface_histidine_pka(protein_states, predictions, prediction_state, binder, target, cutoff, dielectric, debye_length, desolvation, burial_radius, burial_midpoint, min_charge_distance)
+    return float(np.asarray(ph_switch_quality(pka, binding_ph, release_ph)).sum()) if len(pka) else 0.0
+
+@filter_metric('Interface_His_pKa')
+def interface_his_pka_metric(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str='complex', binder: str='binder', target: str='target', cutoff: float=4.0, binding_ph: float=6.4, release_ph: float=7.5, dielectric: float=40.0, debye_length: float=8.0, desolvation: float=2.0, burial_radius: float=10.0, burial_midpoint: float=16.0, min_charge_distance: float=3.0) -> float | None:
+    """Estimated pKa of the best-switching paired interface histidine; None when there is none.
+
+    Diagnostic rather than a threshold to filter on: it says *why* Interface_pH_Switch came out
+    low. Near (binding_ph + release_ph) / 2 is ideal; well below means the site is buried or
+    flanked by Lys/Arg, well above means a carboxylate cage that will stay protonated and
+    never release. Accuracy is that of the loss's pKa model, so read it as a band, not a value.
+    """
+    pka = paired_interface_histidine_pka(protein_states, predictions, prediction_state, binder, target, cutoff, dielectric, debye_length, desolvation, burial_radius, burial_midpoint, min_charge_distance)
+    return float(pka[np.asarray(ph_switch_quality(pka, binding_ph, release_ph)).argmax()]) if len(pka) else None
 
 def paired_cysteine_count(deviation, pairable) -> int:
     bonded, bonds = set(), 0

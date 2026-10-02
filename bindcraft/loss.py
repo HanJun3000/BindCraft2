@@ -274,7 +274,7 @@ def protease_site_loss(protein_states: ProteinStates, predictions: StructurePred
 class PairingContext(NamedTuple):
     binder_sequence: Array     # (n_binder, 20) soft amino-acid probabilities
     binder_mask: Array         # (n_binder,) redesignable residues, float
-    target_sequence: Array     # (n_target, 20) effectively one-hot, target is not redesigned
+    target_sequence: Array     # (n_target, 20) one-hot where the target is fixed, soft where it is redesigned
     target_real: Array         # (n_target,) non-padding residues
     contact: Array             # (n_binder, n_target) differentiable proximity in [0, 1]
 
@@ -292,7 +292,12 @@ def binder_target_pairing_context(protein_states: ProteinStates, predictions: St
 
     binder_sequence = jnp.concatenate([amino_acid_probabilities(protein_complex[name].sequence) for name in binder_chains])
     binder_mask = jnp.concatenate([redesignable_residue_mask(protein_complex[name].flags) for name in binder_chains]).astype(jnp.float32)
-    target_sequence = jax.nn.softmax(protein_complex[target_name].sequence.astype(jnp.float32))
+    # Not jax.nn.softmax: a target read from a structure is stored one-hot (protein.py), and
+    # softmax over a one-hot row returns 0.125 for the true residue and 0.046 for the other 19,
+    # which turns "proximity to D/E" into "proximity to anything" with a mere 1.9x tilt toward
+    # acids. amino_acid_probabilities passes a normalised row through untouched and only
+    # softmaxes rows that are logits, so it is correct for fixed and redesigned targets alike.
+    target_sequence = amino_acid_probabilities(protein_complex[target_name].sequence)
     target_real = real_residue_mask(protein_complex[target_name].flags)
 
     chain_slices = chain_residue_slices(protein_complex)
@@ -364,6 +369,126 @@ def interface_his_acid_symmetric_loss(protein_states: ProteinStates, predictions
 
     # Return negative reward — optimizer minimises, so this drives the pairs together
     return -_masked_mean(per_residue_score, context.binder_mask)
+
+HISTIDINE_MODEL_PKA = 6.00          # unperturbed imidazole; matches SIDE_CHAIN_PKA['H'] in filters.py
+COULOMB_PREFACTOR = 332.06          # kcal/mol * A, two unit charges in vacuum
+LOG10_RT = 1.3645                   # 2.303 R T at 298 K in kcal/mol — converts energy to pKa units
+BURIAL_CONTACT_TEMPERATURE = 2.0    # same soft neighbour count as binder_residue_exposure
+BURIAL_TEMPERATURE = 4.0
+
+class ProtonationEnvironment(NamedTuple):
+    pka: Array             # (n_binder,) estimated pKa of a histidine placed at this binder position
+    coulomb_shift: Array   # (n_binder,) electrostatic component of the shift, pKa units
+    burial: Array          # (n_binder,) soft burial in [0, 1]
+
+def complex_side_chain_charge(protein_complex: dict[str, Protein]) -> tuple[Array, Array]:
+    """Formal side-chain charge per residue over the whole complex, in sorted-chain row order.
+
+    K/R count as +1 and D/E as -1; histidine counts as 0 because the reference state for a
+    pKa calculation is every *other* titratable group at its neutral-pH protonation. Binder
+    rows carry designed logits and are therefore differentiable; fixed target rows are one-hot.
+    """
+    sequence = jnp.concatenate([amino_acid_probabilities(protein_complex[name].sequence) for name in sorted(protein_complex)])
+    weights = complex_residue_weights(protein_complex)
+    charge = sequence[:, AMINO_ACID_INDEX['K']] + sequence[:, AMINO_ACID_INDEX['R']] - acid_probability(sequence)
+    return charge * weights, weights
+
+def histidine_protonation_environment(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str, binder: str, dielectric: float, debye_length: float, desolvation: float, burial_radius: float, burial_midpoint: float, min_charge_distance: float) -> ProtonationEnvironment:
+    """Estimate, for every binder position, the pKa a histidine placed there would have.
+
+        pKa = 6.00 + screened Coulomb shift from surrounding charges - desolvation * burial
+
+    Both correction terms read the *predicted* pseudo-beta coordinates of the whole complex,
+    so they are differentiable through the structure, and the charge profile is differentiable
+    through the designed sequence. The optimizer can therefore tune a histidine's pKa by moving
+    the binder, by placing or removing a nearby binder D/E/K/R, or by changing how buried the
+    site is — which is the point of the exercise.
+
+    A nearby carboxylate stabilises the cationic form and raises the pKa; a nearby Lys or Arg
+    lowers it; burial desolvates the charge and lowers it. This is a Tanford-Kirkwood-flavoured
+    estimate with a single effective dielectric, not a Poisson-Boltzmann calculation — see
+    interface_his_acid_pka_loss for what it does and does not capture.
+    """
+    protein_complex = protein_states[prediction_state]
+    predicted_complex = predictions[prediction_state].protein_complex
+    binder_rows = chain_group_rows(protein_complex, binder_copy_chains(protein_complex, binder))
+
+    coordinates = jnp.concatenate([pseudo_beta_coordinates(predicted_complex[name])[0] for name in sorted(predicted_complex)])
+    charge, weights = complex_side_chain_charge(protein_complex)
+    distance = pairwise_atom_distances(coordinates[binder_rows], coordinates)                      # (n_binder, n_complex)
+    partner = weights[None, :] * (1.0 - jax.nn.one_hot(binder_rows, coordinates.shape[0]))         # drop padding and self
+
+    # Debye-Huckel screened Coulomb. The floor keeps 1/r finite and caps any single partner's
+    # contribution; pseudo-beta underestimates charge-centre separation, which `dielectric` absorbs.
+    screened = jnp.exp(-distance / debye_length) / jnp.maximum(distance, min_charge_distance)
+    coulomb_shift = -(COULOMB_PREFACTOR / (dielectric * LOG10_RT)) * (charge[None, :] * screened * partner).sum(-1)
+
+    neighbors = (jax.nn.sigmoid((burial_radius - distance) / BURIAL_CONTACT_TEMPERATURE) * partner).sum(-1)
+    burial = jax.nn.sigmoid((neighbors - burial_midpoint) / BURIAL_TEMPERATURE)
+    return ProtonationEnvironment(HISTIDINE_MODEL_PKA + coulomb_shift - desolvation * burial, coulomb_shift, burial)
+
+def protonated_fraction(ph: float, pka: Array) -> Array:
+    """Henderson-Hasselbalch: the fraction of a group with this pKa that is protonated at this pH."""
+    return jax.nn.sigmoid(jnp.log(10.0) * (pka - ph))
+
+def ph_switch_quality(pka: Array, binding_ph: float, release_ph: float) -> Array:
+    """Protonation gained on going from release_ph down to binding_ph, scaled to its best value.
+
+    Returns 1.0 for a histidine whose pKa sits at the midpoint of the two pH values, which is
+    where the swing is largest, and falls off on *both* sides: a pKa that is too low never
+    protonates at the binding pH, and a pKa that is too high stays protonated at the release pH
+    and so never lets go. That two-sided fall-off is the whole reason this function exists.
+    """
+    if not binding_ph < release_ph:
+        raise ValueError(f'ph_switch_quality: binding_ph ({binding_ph}) must be below release_ph ({release_ph}) — a histidine switch binds in its protonated, lower-pH state')
+    best_pka = (binding_ph + release_ph) / 2.0
+    span = protonated_fraction(binding_ph, best_pka) - protonated_fraction(release_ph, best_pka)
+    return (protonated_fraction(binding_ph, pka) - protonated_fraction(release_ph, pka)) / span
+
+@loss('interface_his_acid_pka', target_weighting='binds_target')
+def interface_his_acid_pka_loss(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str='complex', binder: str='binder', target: str='target', cutoff: float=8.0, binding_ph: float=6.4, release_ph: float=7.5, pka_weight: float=1.0, dielectric: float=40.0, debye_length: float=8.0, desolvation: float=2.0, burial_radius: float=10.0, burial_midpoint: float=16.0, min_charge_distance: float=3.0) -> Array:
+    """interface_his_acid_pairing, weighted by how well each histidine's *local* pKa switches.
+
+    The plain pairing loss rewards binder His near target D/E and nothing else, so its reward
+    grows without bound as carboxylates pile up. Real switching does not: a lone solvent-exposed
+    His-Asp pair lands near pKa 6.9 and swings ~56% protonation between pH 6.4 and 7.5, while a
+    His caged by three carboxylates is pushed past pKa 8.7 and swings ~5% — it is protonated at
+    both pH values and never releases. The pairing loss scores that cage three times *better*;
+    this loss scores it four times worse. Rewarding the failure mode hardest is the defect being
+    fixed here.
+
+    Each candidate histidine's pKa is estimated from its surroundings (screened Coulomb from
+    nearby charges, minus a desolvation penalty for burial) and converted to a switch quality in
+    (0, 1] that peaks at pKa = (binding_ph + release_ph) / 2. The pairing reward is multiplied by
+    it. Because the modulation only ever attenuates, this loss can never push a histidine away
+    from the interface; it withdraws reward from pairs that would not titrate in the working range.
+
+    Three things the plain loss cannot see and this one can: nearby Lys/Arg, which cancel a
+    carboxylate's shift; burial, which the 8 A contact term actively selects *for* even though a
+    buried histidine titrates poorly; and the pH values themselves, which never entered the plain
+    loss at all and are now what sets the pKa being aimed at.
+
+    Caveats. The pKa model is Tanford-Kirkwood-flavoured with one effective `dielectric`, not a
+    Poisson-Boltzmann calculation; it is cheap and differentiable, and its job is to give the
+    objective the right *shape*, not to predict pKa to a tenth of a unit. Pseudo-beta positions
+    stand in for charge centres. Desolvation is applied only to the histidine, not to its
+    carboxylate partner, and the dielectric does not drop with burial — together a deliberate
+    bias toward solvent-accessible, kinetically fast titration sites. Chain termini are not
+    charged, and no self-consistency is attempted between coupled titratable groups.
+
+    `pka_weight=0` recovers interface_his_acid_pairing exactly, for ablation.
+    """
+    prediction_state = resolve_prediction_state(predictions, prediction_state)
+    context = binder_target_pairing_context(protein_states, predictions, prediction_state, binder, target, cutoff)
+    environment = histidine_protonation_environment(protein_states, predictions, prediction_state, binder, dielectric, debye_length, desolvation, burial_radius, burial_midpoint, min_charge_distance)
+
+    his_binder = context.binder_sequence[:, AMINO_ACID_INDEX['H']]                     # (n_binder,)
+    acid_target = acid_probability(context.target_sequence) * context.target_real      # (n_target,)
+    coupling = (context.contact * acid_target[None, :]).sum(-1)                        # (n_binder,) — as in the plain loss
+    modulation = (1.0 - pka_weight) + pka_weight * ph_switch_quality(environment.pka, binding_ph, release_ph)
+
+    # Return negative reward — optimizer minimises, so this drives His toward acids it can titrate against
+    return -_masked_mean(his_binder * coupling * modulation, context.binder_mask)
 
 def binder_residue_exposure(protein_states: ProteinStates, predictions: StructurePredictions, prediction_state: str, chain: str, radius: float=10.0, contact_temperature: float=2.0, neighbor_threshold: float=16.0, temperature: float=4.0) -> Array:
     predicted_complex = predictions[prediction_state].protein_complex

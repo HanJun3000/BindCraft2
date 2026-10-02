@@ -1,0 +1,13 @@
+{
+  "description": "Favour binder histidines paired with target D/E whose estimated local pKa actually titrates between the binding and release pH — rewards a switch, not a count of His-acid contacts",
+  "weights_interface_his_acid_pka": 1.0,
+  "min_interface_ph_switch_final": 0.4,
+  "losses": {
+    "interface_his_acid_pka": {
+      "params": {
+        "binding_ph": 6.4,
+        "release_ph": 7.5
+      }
+    }
+  }
+}
